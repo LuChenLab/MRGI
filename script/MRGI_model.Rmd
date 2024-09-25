@@ -1,0 +1,160 @@
+---
+title: "MRGI_model"
+author: "Mervin"
+date: "2024/9/24"
+output: html_document
+---
+#load packages
+```{r}
+library(dplyr)
+library(ROSE)
+library(e1071)
+library(pROC)
+library(randomForest)
+library(ROSE)
+library(caret)
+library(ggrepel)
+```
+
+
+#read data
+```{r}
+InputData <- readRDS("../data/InputData.rds")
+groudTruth <- InputData[InputData$Lable == 1, ]
+Unlabeled <- InputData[InputData$Lable != 1, ]
+```
+
+#PU-learning Spy
+## spy dataset
+```{r}
+set.seed(0818)
+indx <- sample(2, nrow(groudTruth), replace = T, prob = c(0.9, 0.1))
+s <- groudTruth[indx == 2,]
+Ps <- groudTruth[indx == 1,]
+Us <- rbind(Unlabeled, s )
+
+Ps$NewLabel <- 1
+Us$NewLabel <- 0
+```
+
+## oversample
+```{r}
+rn_train <- rbind(Ps, Us)
+balance.over <- ovun.sample(NewLabel~., data = rn_train[-(ncol(rn_train)-1)], p = 0.5, seed = 1, method = "over")$data #-40
+
+table(balance.over$NewLabel)
+```
+
+## naiveBayes classify
+```{r}
+classifier <- naiveBayes(NewLabel ~., balance.over)
+rn_pred_u <- predict(classifier, Unlabeled[, -c(ncol(rn_train)-1)], type = "raw" )
+rn_pred_s <- predict(classifier, s[,-c(ncol(rn_train)-1)], type = "raw" )
+
+```
+
+
+## select reliable negative
+```{r}
+tr <- quantile(rn_pred_s[,2], probs = seq(0,1,0.1))[2][[1]]
+index_RN <- which(rn_pred_u[,2] < tr)
+RN <- Unlabeled[index_RN,]
+RN$Lable <- 0
+Q <- Unlabeled[-index_RN,]
+```
+
+# MRGI model training
+```{r}
+set.seed(0818)
+Dataset <- rbind(RN,groudTruth)
+# Dataset_copy <- Dataset
+# Dataset_copy$symbol <- rownames(Dataset_copy)
+# train_data_V3 <- ovun.sample(Lable~., data = Dataset_copy, p = 0.5, seed = 1, method = "under")$data
+# rownames(train_data_V3) <- train_data_V3$symbol
+# train_data_V3 <- train_data_V3[,-ncol(train_data_V3)]
+# train_RN_genes <- rownames(train_data_V3[train_data_V3$Lable == 0,])
+# saveRDS(train_RN_genes,"./results/table/train_RN_genes_V4.rds")
+# balance.over_2 <- ovun.sample(Lable~., data = Dataset_copy, p = 0.5, seed = 1, method = "under")$data
+balance.over_2 <- ovun.sample(Lable~., data = Dataset, p = 0.5, seed = 1, method = "under")$data
+# balance.over_2 <- balance.over_2[,-ncol(balance.over_2)]
+balance.over_2$Lable <- as.factor( balance.over_2$Lable)
+folds <- createFolds(y=balance.over_2$Lable,k=10)  ### 10-fold
+RF_classifier <- list()
+roc_obj <- list()
+auc_value <- list()
+
+## confirming best parameters
+# n <- length(names(balance.over_2))
+# rates = 1 
+# for(i in 1:(n-1)){
+#   rf_train<-randomForest(balance.over_2$Lable~.,data=balance.over_2,mtry=i,na.action = na.roughfix,ntree=1000) 
+#   rates[i]<-mean(rf_train$err.rate)   # based on OOB data error rate
+#   print(rates[i]) 
+# }
+# which(rates == min(rates)) #10
+# ntree_fit<-randomForest(balance.over_2$Lable~.,data=balance.over_2,mtry=5,ntree=1000,na.action = na.roughfix) #800
+# plot(ntree_fit)
+
+for(i in 1:10){
+  fold_test <- balance.over_2[folds[[i]],] #folds[[i]] as test data
+  fold_train <- balance.over_2[-folds[[i]],] # training data
+  
+  RF_classifier_v1 <- randomForest(Lable ~ ., data = fold_train, mtry = 5, ntree = 1000, importance = T)
+  RF_classifier[[i]] <- RF_classifier_v1
+  
+  ##### validation and ROC
+  pred_rf_v1 <- predict(RF_classifier_v1, newdata = fold_test[,-ncol(fold_test)], type = "prob")
+  obs_p_rf_v1 <- data.frame(pred = pred_rf_v1[,2],
+                            obs = fold_test$Lable )
+  rf_roc_v1 <- roc(obs ~ pred, obs_p_rf_v1, levels = c("0", "1"))
+  auc_value_v1 <- as.numeric(auc(rf_roc_v1))
+  
+  roc_obj[[i]] <- rf_roc_v1
+  auc_value[[i]] <- auc_value_v1
+}
+```
+
+# model AUC
+```{r}
+auc_mean <- c()
+for (i in 1:10){
+  auc_mean <- append(auc_mean, auc(roc_obj[[i]]))
+}
+mean(auc_mean)
+
+AUC <- ggroc(roc_obj, alpha = 0.5, linetype = 1, size = 0.8, legacy.axes = TRUE) +
+  geom_segment(aes(x = 0, xend = 1, y = 0, yend = 1), color="grey", linetype="dashed") +
+  theme_bw(base_size = 18) +
+  theme(panel.grid=element_blank(),
+        legend.position = "none",
+        axis.title = element_text(size = 20)) +
+  annotate('text', x=0.7, y=0.3, size=6, color='red', label = "AUCmean = 0.956") +
+  labs(x = "1-Specificity", y = "Sensitivity")
+
+cairo_pdf("./results/V4/Fig.AUC_10fold.pdf", width = 5,height = 4)
+
+save(train_data_V3,balance.over_2,Q,RN,RF_classifier, roc_obj, auc_value, file = "../data/model_V4.Rdata")
+```
+
+#prediction
+```{r}
+load("../data/model_V4.Rdata")
+
+RF_pred_list <- list()
+for (i in 1:10){
+  RF_pred_v1 <- predict( RF_classifier[[i]],InputData[,-ncol(InputData)], type = "prob") %>% as.data.frame
+  colnames(RF_pred_v1) <- c( "NonFunc", "Func" )
+  RF_pred_v1 <- RF_pred_v1[,-1]
+  RF_pred_list[[i]] <- RF_pred_v1
+}
+
+Pred <- as.data.frame(do.call(cbind,RF_pred_list))
+Func_Score <- apply(Pred,1,mean)
+RF_mean_all <- as.data.frame(cbind(symbol = rownames(InputData),Func_Score = Func_Score))
+RF_mean_all <- RF_mean_all[order(RF_mean_all$Func_Score,decreasing = TRUE),]
+RF_mean_all$rank <- 1:nrow(RF_mean_all)
+RF_mean_all$gene_set[RF_mean_all$symbol%in%rownames(groudTruth)] <- "positive"
+RF_mean_all$gene_set[RF_mean_all$symbol%in%rownames(RN)] <- "negative"
+RF_mean_all$gene_set[!RF_mean_all$gene_set%in%c("positive","negative")]<-"unlabeled"
+```
+
